@@ -19,6 +19,7 @@ from langchain.agents import create_agent
 from langchain.tools import BaseTool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
 
 from deerflow.agents.thread_state import SandboxState, ThreadDataState, ThreadState
 from deerflow.config import get_app_config
@@ -27,8 +28,11 @@ from deerflow.models import create_chat_model
 from deerflow.skills.tool_policy import filter_tools_by_skill_allowed_tools
 from deerflow.skills.types import Skill
 from deerflow.subagents.config import SubagentConfig, resolve_subagent_model_name
+from deerflow.subagents.step_events import capture_new_step_messages
 from deerflow.subagents.token_collector import SubagentTokenCollector
+from deerflow.trace_context import DEERFLOW_TRACE_METADATA_KEY
 from deerflow.tracing import build_tracing_callbacks, inject_langfuse_metadata
+from deerflow.utils.messages import message_content_to_text
 
 if TYPE_CHECKING:
     # Imported lazily at runtime inside _build_initial_state: importing
@@ -76,6 +80,12 @@ class SubagentResult:
         status: Current status of the execution.
         result: The final result message (if completed).
         error: Error message (if failed).
+        stop_reason: Why a guardrail cap ended the run early
+            (``token_capped`` / ``turn_capped`` / ``loop_capped``), or ``None``
+            for a clean run. A capped run keeps a normal status — ``completed``
+            when it produced usable output (the partial work survives on
+            ``result``), ``failed`` when it did not — and carries the cap here
+            so the lead can tell "finished" from "capped" (#3875 Phase 2).
         started_at: When execution started.
         completed_at: When execution completed.
         ai_messages: List of complete AI messages (as dicts) generated during execution.
@@ -86,6 +96,7 @@ class SubagentResult:
     status: SubagentStatus
     result: str | None = None
     error: str | None = None
+    stop_reason: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     ai_messages: list[dict[str, Any]] | None = None
@@ -105,6 +116,7 @@ class SubagentResult:
         *,
         result: str | None = None,
         error: str | None = None,
+        stop_reason: str | None = None,
         completed_at: datetime | None = None,
         ai_messages: list[dict[str, Any]] | None = None,
         token_usage_records: list[dict[str, int | str | None]] | None = None,
@@ -126,6 +138,8 @@ class SubagentResult:
                 self.result = result
             if error is not None:
                 self.error = error
+            if stop_reason is not None:
+                self.stop_reason = stop_reason
             if ai_messages is not None:
                 self.ai_messages = ai_messages
             if token_usage_records is not None:
@@ -133,6 +147,49 @@ class SubagentResult:
             self.completed_at = completed_at or datetime.now()
             self.status = status
             return True
+
+
+def _extract_final_result(final_state: Any, *, trace_id: str, name: str) -> str:
+    """Extract a human-readable result string from the streamed subagent state.
+
+    Finds the last ``AIMessage`` in the conversation and stringifies its
+    content via the shared :func:`message_content_to_text` helper; falls back
+    to the last message of any type when no AIMessage is present. Returns a
+    sentinel string (``"No response generated"``) when there is nothing to
+    extract — including when the shared helper yields an empty string — so
+    callers never confuse a missing result with a legitimately empty one.
+
+    Used on both the normal-completion path and the max-turns path
+    (#3875 Phase 2): when ``recursion_limit`` aborts the run mid-flight,
+    ``final_state`` holds the last chunk streamed before the limit fired, so
+    this recovers the partial work instead of dropping it.
+    """
+    if final_state is None:
+        logger.warning(f"[trace={trace_id}] Subagent {name} no final state")
+        return "No response generated"
+
+    messages = final_state.get("messages", [])
+    logger.info(f"[trace={trace_id}] Subagent {name} final messages count: {len(messages)}")
+
+    last_ai_message = None
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            last_ai_message = msg
+            break
+
+    if last_ai_message is not None:
+        text = message_content_to_text(last_ai_message.content)
+        return text if text else "No response generated"
+
+    if messages:
+        last_message = messages[-1]
+        logger.warning(f"[trace={trace_id}] Subagent {name} no AIMessage found, using last message: {type(last_message)}")
+        raw_content = last_message.content if hasattr(last_message, "content") else str(last_message)
+        text = message_content_to_text(raw_content)
+        return text if text else "No response generated"
+
+    logger.warning(f"[trace={trace_id}] Subagent {name} no messages in final state")
+    return "No response generated"
 
 
 # Global storage for background task results
@@ -293,6 +350,8 @@ class SubagentExecutor:
         oauth_provider: str | None = None,
         oauth_id: str | None = None,
         run_id: str | None = None,
+        channel_user_id: str | None = None,
+        deerflow_trace_id: str | None = None,
     ):
         """Initialize the executor.
 
@@ -315,6 +374,8 @@ class SubagentExecutor:
             oauth_id: Subject id at the external identity provider.
             run_id: Parent run id, so delegated guardrail decisions attribute to
                 the same run as the lead agent.
+            deerflow_trace_id: DeerFlow request-level correlation id propagated
+                from the parent run for Langfuse metadata correlation.
         """
         self.config = config
         self.app_config = app_config
@@ -337,6 +398,11 @@ class SubagentExecutor:
         self.oauth_provider = oauth_provider
         self.oauth_id = oauth_id
         self.run_id = run_id
+        # IM-channel sender identity captured at task_tool dispatch: group
+        # chats share one thread across senders, so delegated bash commands
+        # must export the dispatching turn's id, not none at all.
+        self.channel_user_id = channel_user_id
+        self.deerflow_trace_id = deerflow_trace_id
 
         self._base_tools = _filter_tools(
             tools,
@@ -344,6 +410,14 @@ class SubagentExecutor:
             config.disallowed_tools,
         )
         self.tools = self._base_tools
+        # Guard middlewares that expose ``consume_stop_reason`` (currently
+        # ``TokenBudgetMiddleware`` and ``LoopDetectionMiddleware``), captured in
+        # ``_create_agent`` so ``_aexecute`` can read each after the run and
+        # surface whichever cap fired (token_capped / loop_capped) to the lead
+        # (#3875 Phase 2). Collected as a list — every guard must be checked,
+        # not just the first — because the v2 contract advertises more than one
+        # cap reason.
+        self._stop_reason_middlewares: list[Any] = []
 
         logger.info(f"[trace={self.trace_id}] SubagentExecutor initialized: {config.name} with {len(self.tools)} tools")
 
@@ -361,8 +435,22 @@ class SubagentExecutor:
 
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
 
-        # Reuse shared middleware composition with lead agent.
-        middlewares = build_subagent_runtime_middlewares(app_config=app_config, model_name=self.model_name, lazy_init=True, deferred_setup=deferred_setup)
+        # Reuse shared middleware composition with lead agent. ``agent_name``
+        # lets the builder resolve the per-agent token_budget override.
+        middlewares = build_subagent_runtime_middlewares(
+            app_config=app_config,
+            model_name=self.model_name,
+            lazy_init=True,
+            deferred_setup=deferred_setup,
+            agent_name=self.config.name,
+        )
+        # Collect every guard middleware that exposes ``consume_stop_reason``
+        # (TokenBudgetMiddleware, LoopDetectionMiddleware) so _aexecute can read
+        # each after the run and surface whichever cap fired. Duck-typed
+        # (``hasattr``) so this file needs no import of the middleware classes;
+        # a list (not ``next(...)``) so every guard is checked and a later one
+        # is picked up automatically.
+        self._stop_reason_middlewares = [m for m in middlewares if hasattr(m, "consume_stop_reason")]
 
         # system_prompt is included in initial state messages (see _build_initial_state)
         # to avoid multiple SystemMessages which some LLM APIs don't support.
@@ -374,6 +462,24 @@ class SubagentExecutor:
             state_schema=ThreadState,
             checkpointer=False,
         )
+
+    def _consume_guard_stop_reason(self) -> str | None:
+        """Pop and return the guard-cap stop reason set during the last run.
+
+        Checks every guard middleware that exposes ``consume_stop_reason``
+        (collected in :meth:`_create_agent`) and returns the first non-``None``
+        reason — ``"token_capped"`` when the token-budget hard stop fired,
+        ``"loop_capped"`` when loop detection forced a stop, otherwise ``None``.
+        Each guard's cap does not raise (the run still completes with a final
+        answer), so this is how the executor learns a completion was actually
+        capped. Typically at most one guard fires per run, but checking all of
+        them keeps the contract's full cap vocabulary reachable.
+        """
+        for mw in self._stop_reason_middlewares:
+            reason = mw.consume_stop_reason(self.run_id)
+            if reason is not None:
+                return reason
+        return None
 
     async def _load_skills(self) -> list[Skill]:
         """Load enabled skill metadata based on config.skills."""
@@ -527,6 +633,15 @@ class SubagentExecutor:
         if ai_messages is None:
             ai_messages = []
             result.ai_messages = ai_messages
+        # O(1) duplicate detection for streamed AI messages. ``stream_mode="values"``
+        # re-yields the full state every super-step, so the same trailing message is
+        # re-examined on each chunk; an id-keyed set keeps that check O(1) instead of
+        # rescanning the append-only ``ai_messages`` list (O(n) per chunk -> O(n^2)
+        # over a run, which reaches max_turns=150 for deep-research subagents).
+        seen_message_ids: set[str] = {mid for msg in ai_messages if (mid := msg.get("id"))}
+        # Cursor into the append-only message history so each ``values``-mode
+        # chunk only re-scans the newly-appended tail (see capture_new_step_messages).
+        processed_message_count = 0
 
         collector: SubagentTokenCollector | None = None
         try:
@@ -571,6 +686,7 @@ class SubagentExecutor:
                 assistant_id=assistant_id,
                 model_name=self.model_name,
                 environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
+                deerflow_trace_id=self.deerflow_trace_id,
             )
 
             context: dict[str, Any] = {}
@@ -588,6 +704,10 @@ class SubagentExecutor:
             context["oauth_provider"] = self.oauth_provider
             context["oauth_id"] = self.oauth_id
             context["run_id"] = self.run_id
+            if self.channel_user_id:
+                context["channel_user_id"] = self.channel_user_id
+            if self.deerflow_trace_id:
+                context[DEERFLOW_TRACE_METADATA_KEY] = self.deerflow_trace_id
             context["is_subagent"] = True
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} starting async execution with max_turns={self.config.max_turns}")
@@ -622,109 +742,76 @@ class SubagentExecutor:
 
                 final_state = chunk
 
-                # Extract AI messages from the current state
+                # Capture every step message (assistant turns AND tool outputs)
+                # appended since the last chunk. A single super-step can append
+                # several ToolMessages when the model emits multiple tool calls in
+                # one turn, so capturing only messages[-1] would drop all but the
+                # last output (#3779). Dedup/serialization live in capture_step_message.
                 messages = chunk.get("messages", [])
-                if messages:
-                    last_message = messages[-1]
-                    # Check if this is a new AI message
-                    if isinstance(last_message, AIMessage):
-                        # Convert message to dict for serialization
-                        message_dict = last_message.model_dump()
-                        # Only add if it's not already in the list (avoid duplicates)
-                        # Check by comparing message IDs if available, otherwise compare full dict
-                        message_id = message_dict.get("id")
-                        is_duplicate = False
-                        if message_id:
-                            is_duplicate = any(msg.get("id") == message_id for msg in ai_messages)
-                        else:
-                            is_duplicate = message_dict in ai_messages
-
-                        if not is_duplicate:
-                            ai_messages.append(message_dict)
-                            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured AI message #{len(ai_messages)}")
+                previous_count = len(ai_messages)
+                processed_message_count = capture_new_step_messages(messages, ai_messages, seen_message_ids, processed_message_count)
+                if len(ai_messages) > previous_count:
+                    logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured {len(ai_messages) - previous_count} step message(s); total #{len(ai_messages)}")
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} completed async execution")
             token_usage_records = collector.snapshot_records()
-            final_result: str | None = None
-
-            if final_state is None:
-                logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no final state")
-                final_result = "No response generated"
-            else:
-                # Extract the final message - find the last AIMessage
-                messages = final_state.get("messages", [])
-                logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} final messages count: {len(messages)}")
-
-                # Find the last AIMessage in the conversation
-                last_ai_message = None
-                for msg in reversed(messages):
-                    if isinstance(msg, AIMessage):
-                        last_ai_message = msg
-                        break
-
-                if last_ai_message is not None:
-                    content = last_ai_message.content
-                    # Handle both str and list content types for the final result
-                    if isinstance(content, str):
-                        final_result = content
-                    elif isinstance(content, list):
-                        # Extract text from list of content blocks for final result only.
-                        # Concatenate raw string chunks directly, but preserve separation
-                        # between full text blocks for readability.
-                        text_parts = []
-                        pending_str_parts = []
-                        for block in content:
-                            if isinstance(block, str):
-                                pending_str_parts.append(block)
-                            elif isinstance(block, dict):
-                                if pending_str_parts:
-                                    text_parts.append("".join(pending_str_parts))
-                                    pending_str_parts.clear()
-                                text_val = block.get("text")
-                                if isinstance(text_val, str):
-                                    text_parts.append(text_val)
-                        if pending_str_parts:
-                            text_parts.append("".join(pending_str_parts))
-                        final_result = "\n".join(text_parts) if text_parts else "No text content in response"
-                    else:
-                        final_result = str(content)
-                elif messages:
-                    # Fallback: use the last message if no AIMessage found
-                    last_message = messages[-1]
-                    logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no AIMessage found, using last message: {type(last_message)}")
-                    raw_content = last_message.content if hasattr(last_message, "content") else str(last_message)
-                    if isinstance(raw_content, str):
-                        final_result = raw_content
-                    elif isinstance(raw_content, list):
-                        parts = []
-                        pending_str_parts = []
-                        for block in raw_content:
-                            if isinstance(block, str):
-                                pending_str_parts.append(block)
-                            elif isinstance(block, dict):
-                                if pending_str_parts:
-                                    parts.append("".join(pending_str_parts))
-                                    pending_str_parts.clear()
-                                text_val = block.get("text")
-                                if isinstance(text_val, str):
-                                    parts.append(text_val)
-                        if pending_str_parts:
-                            parts.append("".join(pending_str_parts))
-                        final_result = "\n".join(parts) if parts else "No text content in response"
-                    else:
-                        final_result = str(raw_content)
-                else:
-                    logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no messages in final state")
-                    final_result = "No response generated"
-
-            if final_result is None:
-                final_result = "No response generated"
-
+            final_result = _extract_final_result(final_state, trace_id=self.trace_id, name=self.config.name)
+            # A guard hard-stop (token budget or loop detection) does not raise
+            # — it strips tool_calls so the run completes with a final answer.
+            # ``consume_stop_reason`` on each guard tells us whether that
+            # happened so we can mark the completed result with the cap reason
+            # (token_capped / loop_capped) for the lead (#3875 Phase 2).
+            stop_reason = self._consume_guard_stop_reason()
             result.try_set_terminal(
                 SubagentStatus.COMPLETED,
                 result=final_result,
+                stop_reason=stop_reason,
                 token_usage_records=token_usage_records,
             )
+
+        except GraphRecursionError:
+            # ``recursion_limit`` on run_config == ``self.config.max_turns``
+            # (set above). Hitting it means the subagent exhausted its turn
+            # budget. Route into the additive ``stop_reason`` channel (#3875
+            # Phase 2) rather than a dedicated status enum (which would break v1
+            # contract consumers). If the run streamed usable partial work,
+            # surface it as ``completed``; otherwise ``failed``. Either way the
+            # lead can tell "out of budget" from "broken subagent" without
+            # parsing result text.
+            #
+            # Prefer a guard's stop reason if one already fired this run: a
+            # token-budget / loop hard-stop strips tool_calls to force a final
+            # answer, and if ``recursion_limit`` then trips on the next
+            # super-step before that answer lands, the guard was the binding
+            # constraint — not the turn budget. Consulting the guards here (same
+            # lookup as the normal-completion path above) keeps the two paths
+            # consistent and pops the reason so it is not orphaned in the dict.
+            max_turns = self.config.max_turns
+            logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} reached max_turns={max_turns} (GraphRecursionError); recovering partial result")
+            messages = (final_state or {}).get("messages", [])
+            usable_partial: str | None = None
+            for m in reversed(messages):
+                if isinstance(m, AIMessage):
+                    text = message_content_to_text(m.content).strip()
+                    if text:
+                        usable_partial = text
+                    break
+            records = collector.snapshot_records() if collector is not None else None
+            stop_reason = self._consume_guard_stop_reason() or "turn_capped"
+            if usable_partial is not None:
+                result.try_set_terminal(
+                    SubagentStatus.COMPLETED,
+                    result=usable_partial,
+                    stop_reason=stop_reason,
+                    token_usage_records=records,
+                )
+            else:
+                result.try_set_terminal(
+                    SubagentStatus.FAILED,
+                    error=f"Reached max_turns={max_turns}",
+                    stop_reason=stop_reason,
+                    token_usage_records=records,
+                )
 
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")

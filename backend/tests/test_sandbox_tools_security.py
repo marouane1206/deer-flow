@@ -9,6 +9,7 @@ from deerflow.sandbox.exceptions import SandboxError
 from deerflow.sandbox.tools import (
     VIRTUAL_PATH_PREFIX,
     _apply_cwd_prefix,
+    _compiled_mask_patterns,
     _get_custom_mount_for_path,
     _get_custom_mounts,
     _is_acp_workspace_path,
@@ -112,6 +113,40 @@ def test_mask_local_paths_in_output_hides_skills_host_paths() -> None:
 
         assert "/home/user/deer-flow/skills" not in masked
         assert "/mnt/skills/public/bootstrap/SKILL.md" in masked
+
+
+def test_mask_local_paths_compiled_patterns_are_cached() -> None:
+    """The compiled patterns for a given source set are built once and reused
+    (mask runs once per glob/grep match, so this avoids per-match recompiles)."""
+    sources = (("/tmp/deer-flow/threads/t1/user-data/workspace", "/mnt/user-data/workspace"),)
+    first = _compiled_mask_patterns(sources)
+    second = _compiled_mask_patterns(sources)
+    assert first is second  # cache hit -> identical object, not rebuilt
+
+
+def test_mask_local_paths_stable_across_repeated_and_batched_calls() -> None:
+    """Masking is identical whether applied once or repeatedly (per-match path)."""
+    output = "a /tmp/deer-flow/threads/t1/user-data/workspace/x.txt and /tmp/deer-flow/threads/t1/user-data/outputs/y.log"
+    once = mask_local_paths_in_output(output, _THREAD_DATA)
+    twice = mask_local_paths_in_output(once, _THREAD_DATA)
+    assert "/tmp/deer-flow/threads/t1/user-data" not in once
+    assert "/mnt/user-data/workspace/x.txt" in once
+    assert "/mnt/user-data/outputs/y.log" in once
+    # Re-masking already-masked output leaves it unchanged (no host paths left).
+    assert twice == once
+    # Mapping outputs one-by-one matches masking each independently.
+    assert [mask_local_paths_in_output(o, _THREAD_DATA) for o in (output, output)] == [once, once]
+
+
+def test_mask_local_paths_no_thread_data_still_masks_skills() -> None:
+    """With thread_data=None, skills host paths are still masked (user-data skipped)."""
+    with (
+        patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"),
+        patch("deerflow.sandbox.tools._get_skills_host_path", return_value="/home/user/deer-flow/skills"),
+    ):
+        masked = mask_local_paths_in_output("Reading: /home/user/deer-flow/skills/a/b.md", None)
+        assert "/home/user/deer-flow/skills" not in masked
+        assert "/mnt/skills/a/b.md" in masked
 
 
 # ---------- _reject_path_traversal ----------
@@ -271,29 +306,39 @@ def test_resolve_and_validate_user_data_path_blocks_traversal(tmp_path: Path) ->
 # ---------- replace_virtual_paths_in_command ----------
 
 
-def test_replace_virtual_paths_in_command_replaces_skills_paths() -> None:
-    """Skills virtual paths in commands should be resolved to host paths."""
+def test_replace_virtual_paths_in_command_does_not_replace_skills_paths() -> None:
+    """Skills virtual paths in commands should NOT be resolved by replace_virtual_paths_in_command.
+
+    Skills and ACP workspace paths are resolved by the sandbox's
+    PathMapping at execution time, not by pre-resolving in
+    replace_virtual_paths_in_command, because the sandbox's user_id
+    (from acquire time) may differ from the contextvar user_id used by
+    _resolve_skills_path / _resolve_acp_workspace_path.
+    """
     with (
         patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"),
         patch("deerflow.sandbox.tools._get_skills_host_path", return_value="/home/user/deer-flow/skills"),
     ):
         cmd = "cat /mnt/skills/public/bootstrap/SKILL.md"
         result = replace_virtual_paths_in_command(cmd, _THREAD_DATA)
-        assert "/mnt/skills" not in result
-        assert "/home/user/deer-flow/skills/public/bootstrap/SKILL.md" in result
+        # Skills paths should remain as virtual paths (not resolved)
+        assert "/mnt/skills/public/bootstrap/SKILL.md" in result
+        assert "/home/user/deer-flow/skills" not in result
 
 
-def test_replace_virtual_paths_in_command_replaces_both() -> None:
-    """Both user-data and skills paths should be replaced in the same command."""
+def test_replace_virtual_paths_in_command_replaces_user_data_only() -> None:
+    """Only user-data paths should be replaced; skills and ACP paths stay virtual."""
     with (
         patch("deerflow.sandbox.tools._get_skills_container_path", return_value="/mnt/skills"),
         patch("deerflow.sandbox.tools._get_skills_host_path", return_value="/home/user/skills"),
     ):
         cmd = "cat /mnt/skills/public/SKILL.md > /mnt/user-data/workspace/out.txt"
         result = replace_virtual_paths_in_command(cmd, _THREAD_DATA)
-        assert "/mnt/skills" not in result
+        # Skills paths should remain virtual
+        assert "/mnt/skills/public/SKILL.md" in result
+        assert "/home/user/skills" not in result
+        # User-data paths should still be resolved
         assert "/mnt/user-data" not in result
-        assert "/home/user/skills/public/SKILL.md" in result
         assert "/tmp/deer-flow/threads/t1/user-data/workspace/out.txt" in result
 
 
@@ -734,14 +779,22 @@ def test_resolve_acp_workspace_path_blocks_traversal(tmp_path: Path) -> None:
             _resolve_acp_workspace_path("/mnt/acp-workspace/../../etc/passwd")
 
 
-def test_replace_virtual_paths_in_command_replaces_acp_workspace() -> None:
-    """ACP workspace virtual paths in commands should be resolved to host paths."""
+def test_replace_virtual_paths_in_command_does_not_replace_acp_workspace() -> None:
+    """ACP workspace virtual paths should NOT be resolved by replace_virtual_paths_in_command.
+
+    Like skills paths, ACP workspace paths are resolved by the sandbox's
+    PathMapping at execution time, not pre-resolved, to ensure user_id
+    consistency with the sandbox mapping.
+    """
     acp_host = "/home/user/.deer-flow/acp-workspace"
     with patch("deerflow.sandbox.tools._get_acp_workspace_host_path", return_value=acp_host):
         cmd = "cp /mnt/acp-workspace/hello.py /mnt/user-data/outputs/hello.py"
         result = replace_virtual_paths_in_command(cmd, _THREAD_DATA)
-        assert "/mnt/acp-workspace" not in result
-        assert f"{acp_host}/hello.py" in result
+        # ACP workspace path should remain as virtual path (not resolved)
+        assert "/mnt/acp-workspace/hello.py" in result
+        assert acp_host not in result
+        # User-data paths should still be resolved
+        assert "/mnt/user-data" not in result
         assert "/tmp/deer-flow/threads/t1/user-data/outputs/hello.py" in result
 
 

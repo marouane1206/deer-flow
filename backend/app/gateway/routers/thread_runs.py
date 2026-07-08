@@ -25,7 +25,8 @@ from app.gateway.deps import get_checkpointer, get_current_user, get_feedback_re
 from app.gateway.pagination import trim_run_message_page
 from app.gateway.services import sse_consumer, start_run, wait_for_run_completion
 from deerflow.runtime import RunRecord, RunStatus, serialize_channel_values_for_api
-from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY, get_original_user_content_text
+from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY, get_original_user_content_text, message_to_text
+from deerflow.workspace_changes import get_workspace_changes_response
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/threads", tags=["runs"])
@@ -196,29 +197,7 @@ def _message_content(message: Any) -> Any:
 
 
 def _message_text(message: Any) -> str:
-    content = _message_content(message)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-                else:
-                    nested = block.get("content")
-                    if isinstance(nested, str):
-                        parts.append(nested)
-        return "".join(parts)
-    if isinstance(content, dict):
-        for key in ("text", "content"):
-            value = content.get(key)
-            if isinstance(value, str):
-                return value
-    return ""
+    return message_to_text(message)
 
 
 def _message_additional_kwargs(message: Any) -> dict[str, Any]:
@@ -561,10 +540,10 @@ async def join_run(thread_id: str, run_id: str, request: Request) -> StreamingRe
     record = await run_mgr.get(run_id)
     if record is None or record.thread_id != thread_id:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    if record.store_only:
+    bridge = get_stream_bridge(request)
+    if record.store_only and not bridge.supports_cross_process:
         raise HTTPException(status_code=409, detail=f"Run {run_id} is not active on this worker and cannot be streamed")
 
-    bridge = get_stream_bridge(request)
     return StreamingResponse(
         sse_consumer(bridge, record, request, run_mgr),
         media_type="text/event-stream",
@@ -601,7 +580,8 @@ async def stream_existing_run(
     record = await run_mgr.get(run_id)
     if record is None or record.thread_id != thread_id:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    if record.store_only and action is None:
+    bridge = get_stream_bridge(request)
+    if record.store_only and action is None and not bridge.supports_cross_process:
         raise HTTPException(status_code=409, detail=f"Run {run_id} is not active on this worker and cannot be streamed")
 
     # Cancel if an action was requested (stop-button / interrupt flow)
@@ -616,7 +596,6 @@ async def stream_existing_run(
                 pass
             return Response(status_code=204)
 
-    bridge = get_stream_bridge(request)
     return StreamingResponse(
         sse_consumer(bridge, record, request, run_mgr),
         media_type="text/event-stream",
@@ -646,18 +625,26 @@ async def list_thread_messages(
     event_store = get_run_event_store(request)
     messages = await event_store.list_messages(thread_id, limit=limit, before_seq=before_seq, after_seq=after_seq)
 
-    # Attach feedback to the last AI message of each run
-    feedback_repo = get_feedback_repo(request)
+    # Resolve the caller once; it is needed both to scope the feedback query
+    # below and to list the thread's runs for turn-duration injection.
     user_id = await get_current_user(request)
-    feedback_map = await feedback_repo.list_by_thread_grouped(thread_id, user_id=user_id)
 
-    # Find the last ai_message per run_id
+    # Find the last AI message per run_id. AI messages are persisted by
+    # RunJournal with event_type "llm.ai.response" (see runtime/journal.py);
+    # the event store returns that value verbatim, so match on it here.
     last_ai_per_run: dict[str, int] = {}  # run_id -> index in messages list
     for i, msg in enumerate(messages):
-        if msg.get("event_type") == "ai_message":
+        if msg.get("event_type") == "llm.ai.response":
             last_ai_per_run[msg["run_id"]] = i
 
-    # Attach feedback field
+    # Attach feedback to the last AI message of each run. Only query when there
+    # is an AI message to attach it to — threads with no completed AI turn yet
+    # would otherwise pay for a grouped feedback lookup whose result is unused.
+    feedback_map: dict[str, dict] = {}
+    if last_ai_per_run:
+        feedback_repo = get_feedback_repo(request)
+        feedback_map = await feedback_repo.list_by_thread_grouped(thread_id, user_id=user_id)
+
     last_ai_indices = set(last_ai_per_run.values())
     for i, msg in enumerate(messages):
         if i in last_ai_indices:
@@ -742,12 +729,38 @@ async def list_run_events(
     run_id: str,
     request: Request,
     event_types: str | None = Query(default=None),
+    task_id: str | None = Query(default=None),
     limit: int = Query(default=500, le=2000),
+    after_seq: int | None = Query(default=None),
 ) -> list[dict]:
-    """Return the full event stream for a run (debug/audit)."""
+    """Return the full event stream for a run (debug/audit).
+
+    ``task_id`` + ``after_seq`` let the subtask card page through one subagent
+    task's persisted steps without the run-wide ``limit`` truncating the tail (#3779).
+    """
     event_store = get_run_event_store(request)
     types = event_types.split(",") if event_types else None
-    return await event_store.list_events(thread_id, run_id, event_types=types, limit=limit)
+    return await event_store.list_events(thread_id, run_id, event_types=types, task_id=task_id, limit=limit, after_seq=after_seq)
+
+
+@router.get("/{thread_id}/runs/{run_id}/workspace-changes")
+@require_permission("runs", "read", owner_check=True)
+async def get_run_workspace_changes(
+    thread_id: str,
+    run_id: str,
+    request: Request,
+    include_files: bool = Query(default=True),
+    include_diff: bool = Query(default=True),
+) -> dict:
+    """Return workspace/output file changes recorded for one run."""
+    event_store = get_run_event_store(request)
+    return await get_workspace_changes_response(
+        event_store,
+        thread_id,
+        run_id,
+        include_files=include_files,
+        include_diff=include_diff,
+    )
 
 
 @router.get("/{thread_id}/token-usage", response_model=ThreadTokenUsageResponse)
