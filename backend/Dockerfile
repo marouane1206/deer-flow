@@ -90,9 +90,9 @@ COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.7.20
 COPY --from=uv-source /uv /uvx /usr/local/bin/
 
-# Create app user (non-root)
-RUN groupadd -r appuser && \
-    useradd -r -g appuser -d /app -s /sbin/nologin -u 1000 appuser
+# Create app user (non-root) with fixed UID to match existing volumes
+RUN groupadd -r -g 999 appuser && \
+    useradd -r -u 999 -g appuser -d /app -s /sbin/nologin appuser
 
 # Set working directory
 WORKDIR /app
