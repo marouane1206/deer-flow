@@ -1,166 +1,181 @@
-"""Redis Streams-backed stream bridge."""
+"""Redis Streams bridge with Consumer Group support.
+
+Provides durable, cross-process message routing using Redis Streams.
+Each run maps to a Redis Stream + Consumer Group. XREADGROUP ensures
+exactly-one-worker delivery per consumer group. XACK confirms
+micro-step completion.
+
+Usage::
+
+    from deerflow.runtime.stream_bridge.redis import RedisStreamBridge
+
+    bridge = RedisStreamBridge(redis_url="redis://localhost:6379/0")
+    async with bridge:
+        await bridge.publish(run_id, "metadata", {"key": "value"})
+        async for event in bridge.subscribe(run_id):
+            ...
+"""
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import json
 import logging
-from collections.abc import AsyncIterator, Mapping
+import time
+from collections.abc import AsyncIterator
 from typing import Any
-
-try:
-    from redis.asyncio import Redis
-    from redis.exceptions import RedisError, ResponseError
-except ImportError:  # pragma: no cover - only hit when the optional extra is missing
-    # ``redis`` is an optional extra (mirrors the ``postgres``/asyncpg path in
-    # persistence/engine.py). This module is imported lazily from
-    # ``make_stream_bridge`` only when ``stream_bridge.type == "redis"``, so the
-    # hint surfaces exactly when a Redis bridge is requested without the package.
-    raise ImportError(
-        "stream_bridge.type is set to 'redis' but the redis package is not installed.\n"
-        "Install it with:\n"
-        "    cd backend && uv sync --all-packages --extra redis\n"
-        "On the next `make dev` the redis extra is auto-detected from config.yaml\n"
-        "(stream_bridge.type: redis) and reinstalled, so it will not be wiped again.\n"
-        "Or switch to stream_bridge.type: memory in config.yaml for single-process deployment."
-    ) from None
 
 from .base import END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge, StreamEvent
 
 logger = logging.getLogger(__name__)
 
-_KIND_EVENT = "event"
-_KIND_END = "end"
+# Attempt to import redis.asyncio; fail gracefully if not installed.
+try:
+    import redis.asyncio as aioredis
 
-# Batch size for ``XREAD``. Reading more than one entry per round-trip collapses
-# a large ``Last-Event-ID`` replay into far fewer calls; live tailing still
-# yields each event as it arrives because the consume loop returns mid-batch on
-# the end marker.
-_XREAD_COUNT = 64
-
-# Maximum consecutive transient Redis errors (``ConnectionError``,
-# ``TimeoutError``, etc.) tolerated during ``subscribe`` before the error
-# propagates to the caller.  Brief blips are retried with exponential backoff
-# capped at ``heartbeat_interval``.
-_MAX_SUBSCRIBE_RETRIES = 3
+    _REDIS_AVAILABLE = True
+except ImportError:
+    aioredis = None  # type: ignore[assignment]
+    _REDIS_AVAILABLE = False
 
 
 class RedisStreamBridge(StreamBridge):
-    """Per-run stream bridge backed by Redis Streams.
+    """Redis Streams bridge with Consumer Group support.
 
-    Each run is stored in one Redis Stream and subscribers read directly with
-    ``XREAD``.  This keeps the SSE bridge usable across multiple gateway
-    worker processes while preserving ``Last-Event-ID`` replay semantics.
+    Architecture:
+        - Each ``run_id`` maps to a Redis Stream key ``sworm:stream:{run_id}``.
+        - Each consumer group maps to ``sworm:group:{run_id}``.
+        - ``XREADGROUP`` ensures exactly-one-worker delivery within a group.
+        - ``XACK`` is called automatically after yielding each event, and
+          also exposed as an explicit method for manual acknowledgment.
+
+    Args:
+        redis_url: Redis connection URL (e.g. ``redis://localhost:6379/0``).
+        consumer_name: Unique name for this consumer within the group.
+            Defaults to a process-unique identifier.
+        block_ms: Block timeout in milliseconds for ``XREADGROUP``.
+        claim_idle_ms: Minimum idle time (ms) before ``XAUTOCLAIM`` picks
+            up abandoned messages from crashed consumers.
+        stream_maxlen: Maximum entries to retain per stream (approximate).
     """
-
-    supports_cross_process = True
 
     def __init__(
         self,
+        redis_url: str = "redis://localhost:6379/0",
         *,
-        redis_url: str,
+        consumer_name: str | None = None,
+        block_ms: int = 5000,
+        claim_idle_ms: int = 30000,
         queue_maxsize: int = 256,
-        key_prefix: str = "deerflow:stream_bridge",
         max_connections: int | None = None,
-        stream_ttl_seconds: int | None = 86400,
-        client: Redis | None = None,
+        stream_ttl_seconds: int = 86400,
     ) -> None:
+        if not _REDIS_AVAILABLE:
+            raise ImportError("redis[asyncio] is required for RedisStreamBridge. Install it with: pip install redis")
+
         self._redis_url = redis_url
-        self._maxsize = max(1, queue_maxsize)
-        self._key_prefix = key_prefix.rstrip(":")
-        if stream_ttl_seconds is not None and stream_ttl_seconds > 0:
-            self._stream_ttl_seconds = stream_ttl_seconds
-        else:
-            self._stream_ttl_seconds = None
-        # Each live SSE subscriber holds one pooled connection blocked in
-        # ``XREAD ... BLOCK`` for up to ``heartbeat_interval``. ``max_connections``
-        # caps that pool; ``None`` keeps redis-py's effectively-unbounded default.
-        self._redis = client if client is not None else Redis.from_url(redis_url, decode_responses=True, max_connections=max_connections)
-        self._owns_client = client is None
+        self._redis: aioredis.Redis | None = None
+        self._consumer_name = consumer_name or f"sworm-consumer-{id(self):x}"
+        self._block_ms = block_ms
+        self._claim_idle_ms = claim_idle_ms
+        self._stream_maxlen = queue_maxsize
+        self._max_connections = max_connections
+        self._stream_ttl_seconds = stream_ttl_seconds
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    async def _ensure_redis(self) -> aioredis.Redis:
+        """Lazily create the Redis connection pool."""
+        if self._redis is None:
+            pool_kwargs: dict[str, Any] = {
+                "decode_responses": True,
+                "socket_connect_timeout": 5,
+                "socket_keepalive": True,
+                "retry_on_timeout": True,
+            }
+            if self._max_connections is not None:
+                pool_kwargs["max_connections"] = self._max_connections
+            self._redis = aioredis.from_url(self._redis_url, **pool_kwargs)
+        return self._redis
+
+    async def close(self) -> None:
+        """Close the Redis connection."""
+        if self._redis is not None:
+            try:
+                await self._redis.aclose()
+            except Exception:
+                logger.debug("Error closing Redis connection", exc_info=True)
+            self._redis = None
+
+    # ── StreamBridge API ──────────────────────────────────────────────────
 
     def _stream_key(self, run_id: str) -> str:
-        return f"{self._key_prefix}:{run_id}"
+        return f"sworm:stream:{run_id}"
 
-    async def _xadd_retained(self, key: str, fields: dict[str, str], *, maxlen: int) -> None:
-        if self._stream_ttl_seconds is None:
-            await self._redis.xadd(
-                key,
-                fields,
-                maxlen=maxlen,
-                approximate=False,
-            )
-            return
+    def _group_name(self, run_id: str) -> str:
+        return f"sworm:group:{run_id}"
 
-        async with self._redis.pipeline(transaction=True) as pipe:
-            pipe.xadd(
-                key,
-                fields,
-                maxlen=maxlen,
-                approximate=False,
-            )
-            pipe.expire(key, self._stream_ttl_seconds)
-            await pipe.execute()
-
-    @staticmethod
-    def _decode(value: Any) -> str:
-        if isinstance(value, bytes):
-            return value.decode("utf-8")
-        return str(value)
-
-    @classmethod
-    def _normalise_fields(cls, fields: Mapping[Any, Any]) -> dict[str, str]:
-        return {cls._decode(key): cls._decode(value) for key, value in fields.items()}
-
-    @staticmethod
-    def _encode_data(data: Any) -> str:
-        return json.dumps(data, default=str, ensure_ascii=False, separators=(",", ":"))
-
-    @staticmethod
-    def _decode_data(raw: str | None) -> Any:
-        if raw is None:
-            return None
+    async def _ensure_group(self, run_id: str) -> None:
+        """Create the consumer group if it does not exist (idempotent)."""
+        redis = await self._ensure_redis()
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("Redis stream bridge received non-JSON event data")
-            return raw
-
-    def _entry_from_redis(self, event_id: str, fields: Mapping[Any, Any]) -> StreamEvent:
-        payload = self._normalise_fields(fields)
-        kind = payload.get("kind", _KIND_EVENT)
-        if kind == _KIND_END:
-            return END_SENTINEL
-        return StreamEvent(
-            id=event_id,
-            event=payload.get("event", "message"),
-            data=self._decode_data(payload.get("data")),
-        )
+            await redis.xgroup_create(
+                self._stream_key(run_id),
+                self._group_name(run_id),
+                id="0",
+                mkstream=True,
+            )
+            logger.debug("Created consumer group for run %s", run_id)
+        except aioredis.ResponseError as exc:
+            # "BUSYGROUP Consumer Group name already exists" — expected
+            if "BUSYGROUP" not in str(exc):
+                raise
 
     async def publish(self, run_id: str, event: str, data: Any) -> None:
-        key = self._stream_key(run_id)
-        await self._xadd_retained(
-            key,
-            {
-                "kind": _KIND_EVENT,
-                "event": event,
-                "data": self._encode_data(data),
-            },
-            maxlen=self._maxsize,
+        """XADD an event to the run's stream.
+
+        Refreshes the stream key TTL so retained SSE replay buffers are
+        eventually reclaimed even if ``cleanup()`` never runs.
+
+        Args:
+            run_id: The run identifier (becomes the stream key).
+            event: SSE event name (e.g. ``"metadata"``, ``"updates"``).
+            data: JSON-serialisable payload.
+        """
+        redis = await self._ensure_redis()
+        stream_key = self._stream_key(run_id)
+        payload = {
+            "event": event,
+            "data": json.dumps(data, default=str),
+            "ts": str(time.time()),
+        }
+        msg_id = await redis.xadd(
+            stream_key,
+            payload,
+            maxlen=self._stream_maxlen,
+            approximate=True,
         )
+        # Refresh TTL so the stream lives long enough for late subscribers
+        if self._stream_ttl_seconds > 0:
+            await redis.expire(stream_key, self._stream_ttl_seconds)
+        logger.debug("Published event to run %s: id=%s event=%s", run_id, msg_id, event)
 
     async def publish_end(self, run_id: str) -> None:
-        # Keep the configured number of data events plus the internal end marker.
-        key = self._stream_key(run_id)
-        await self._xadd_retained(
-            key,
-            {"kind": _KIND_END},
-            maxlen=self._maxsize + 1,
-        )
+        """Signal that no more events will be produced for *run_id*.
 
-    async def stream_exists(self, run_id: str) -> bool:
-        """Return whether Redis still has retained stream data for *run_id*."""
-        return bool(await self._redis.exists(self._stream_key(run_id)))
+        Inserts a sentinel ``__end__`` marker into the stream and
+        refreshes the TTL so late subscribers can drain it.
+        """
+        redis = await self._ensure_redis()
+        stream_key = self._stream_key(run_id)
+        await redis.xadd(
+            stream_key,
+            {"event": "__end__", "data": "", "ts": str(time.time())},
+            maxlen=self._stream_maxlen,
+            approximate=True,
+        )
+        if self._stream_ttl_seconds > 0:
+            await redis.expire(stream_key, self._stream_ttl_seconds)
+        logger.debug("Published END_SENTINEL for run %s", run_id)
 
     async def subscribe(
         self,
@@ -169,73 +184,196 @@ class RedisStreamBridge(StreamBridge):
         last_event_id: str | None = None,
         heartbeat_interval: float = 15.0,
     ) -> AsyncIterator[StreamEvent]:
-        key = self._stream_key(run_id)
-        stream_id = last_event_id or "0-0"
-        block_ms = max(1, int(heartbeat_interval * 1000)) if heartbeat_interval > 0 else 1
-        consecutive_errors = 0
+        """XREADGROUP consumer that yields events for a run.
+
+        Args:
+            run_id: The run identifier to subscribe to.
+            last_event_id: Resume from this event ID (for reconnection).
+                If ``None``, starts from the latest (``>``).
+            heartbeat_interval: Seconds between heartbeat yields when no
+                events arrive.
+
+        Yields:
+            StreamEvent instances. Yields ``HEARTBEAT_SENTINEL`` when no
+            event arrives within *heartbeat_interval*. Yields
+            ``END_SENTINEL`` when the producer signals stream end.
+        """
+        redis = await self._ensure_redis()
+        await self._ensure_group(run_id)
+
+        stream_key = self._stream_key(run_id)
+        group_name = self._group_name(run_id)
+        consumer = self._consumer_name
+
+        # Starting ID: resume from last_event_id or read new messages only.
+        if last_event_id:
+            # Read from after the last known event
+            cursor_id = last_event_id
+        else:
+            # ">" means only new messages not yet delivered to this consumer
+            cursor_id = ">"
 
         while True:
             try:
-                response = await self._redis.xread({key: stream_id}, count=_XREAD_COUNT, block=block_ms)
-            except ResponseError:
-                # The only client-controllable stream ID is the Last-Event-ID
-                # header, so a rejected ID means a malformed reconnect token:
-                # fall back to replaying from the earliest retained event. We key
-                # off the control flow rather than the error wording, which is the
-                # server's text (Redis/Valkey/Dragonfly) and not a stable API. If
-                # the reset read from "0-0" also fails, the stream/connection is
-                # genuinely broken, so re-raise.
-                if stream_id == "0-0":
-                    raise
-                logger.warning(
-                    "Redis rejected Last-Event-ID %r for stream bridge; replaying from earliest retained event",
-                    stream_id,
-                    exc_info=True,
+                entries = await redis.xreadgroup(
+                    groupname=group_name,
+                    consumername=consumer,
+                    streams={stream_key: cursor_id},
+                    count=1,
+                    block=self._block_ms,
                 )
-                stream_id = "0-0"
+            except aioredis.ConnectionError:
+                logger.warning("Redis connection lost for run %s; retrying...", run_id)
+                self._redis = None  # Force reconnection
+                await self._ensure_redis()
                 continue
-            except RedisError:
-                consecutive_errors += 1
-                if consecutive_errors > _MAX_SUBSCRIBE_RETRIES:
-                    raise
-                delay = min(2**consecutive_errors, heartbeat_interval)
-                logger.warning(
-                    "Transient Redis error in stream bridge subscriber (retry %d/%d); backing off %.1fs",
-                    consecutive_errors,
-                    _MAX_SUBSCRIBE_RETRIES,
-                    delay,
-                    exc_info=True,
-                )
-                await asyncio.sleep(delay)
-                continue
-            else:
-                consecutive_errors = 0
-
-            if not response:
+            except Exception:
+                logger.error("XREADGROUP error for run %s", run_id, exc_info=True)
                 yield HEARTBEAT_SENTINEL
                 continue
 
-            for _stream_name, entries in response:
-                for event_id, fields in entries:
-                    event_id = self._decode(event_id)
-                    stream_id = event_id
-                    entry = self._entry_from_redis(event_id, fields)
-                    if entry is END_SENTINEL:
+            if not entries:
+                # No messages within block timeout — yield heartbeat
+                yield HEARTBEAT_SENTINEL
+                continue
+
+            for _stream, messages in entries:
+                for msg_id, fields in messages:
+                    cursor_id = msg_id
+
+                    event_name = fields.get("event", "")
+                    data_raw = fields.get("data", "")
+
+                    if event_name == "__end__":
+                        # Auto-ACK the end sentinel
+                        await redis.xack(stream_key, group_name, msg_id)
                         yield END_SENTINEL
                         return
-                    yield entry
+
+                    # Parse data
+                    try:
+                        data = json.loads(data_raw) if data_raw else None
+                    except (json.JSONDecodeError, TypeError):
+                        data = data_raw
+
+                    # Auto-ACK after successful read
+                    await redis.xack(stream_key, group_name, msg_id)
+
+                    yield StreamEvent(id=str(msg_id), event=event_name, data=data)
+
+    async def ack(self, run_id: str, event_id: str) -> None:
+        """Explicit XACK for manual micro-step completion tracking.
+
+        Use this when you need to acknowledge processing *after* yielding
+        the event, rather than relying on auto-ACK in ``subscribe()``.
+        """
+        redis = await self._ensure_redis()
+        await redis.xack(
+            self._stream_key(run_id),
+            self._group_name(run_id),
+            event_id,
+        )
+        logger.debug("ACK'd event %s for run %s", event_id, run_id)
 
     async def cleanup(self, run_id: str, *, delay: float = 0) -> None:
+        """Delete the stream and consumer group for *run_id*.
+
+        Args:
+            run_id: The run to clean up.
+            delay: Seconds to wait before cleanup (gives late subscribers
+                time to drain).
+        """
+        import asyncio
+
         if delay > 0:
             await asyncio.sleep(delay)
-        await self._redis.delete(self._stream_key(run_id))
 
-    async def close(self) -> None:
-        if not self._owns_client:
-            return
-        close = getattr(self._redis, "aclose", None) or getattr(self._redis, "close", None)
-        if close is None:
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
+        redis = await self._ensure_redis()
+        stream_key = self._stream_key(run_id)
+        group_name = self._group_name(run_id)
+
+        try:
+            await redis.xgroup_destroy(stream_key, group_name)
+        except Exception:
+            logger.debug("Error destroying group for run %s", run_id, exc_info=True)
+
+        try:
+            await redis.delete(stream_key)
+        except Exception:
+            logger.debug("Error deleting stream for run %s", run_id, exc_info=True)
+
+        logger.debug("Cleaned up stream and group for run %s", run_id)
+
+    # ── Utility methods ───────────────────────────────────────────────────
+
+    async def get_stream_info(self, run_id: str) -> dict[str, Any]:
+        """Get diagnostic info about a run's stream (for monitoring)."""
+        redis = await self._ensure_redis()
+        stream_key = self._stream_key(run_id)
+        try:
+            info = await redis.xinfo_stream(stream_key)
+            return {
+                "run_id": run_id,
+                "stream_key": stream_key,
+                "length": info.get("length", 0),
+                "first_entry": info.get("first-entry"),
+                "last_entry": info.get("last-entry"),
+            }
+        except Exception:
+            return {"run_id": run_id, "error": "stream not found"}
+
+    async def get_pending_info(self, run_id: str) -> dict[str, Any]:
+        """Get pending messages for the consumer group (for monitoring)."""
+        redis = await self._ensure_redis()
+        try:
+            pending = await redis.xpending_range(
+                self._stream_key(run_id),
+                self._group_name(run_id),
+                min="-",
+                max="+",
+                count=100,
+            )
+            return {
+                "run_id": run_id,
+                "pending_count": len(pending),
+                "pending_messages": pending,
+            }
+        except Exception:
+            return {"run_id": run_id, "error": "no pending info available"}
+
+    async def reclaim_idle_messages(
+        self,
+        run_id: str,
+        count: int = 10,
+    ) -> list[StreamEvent]:
+        """XAUTOCLAIM messages that have been idle too long.
+
+        Useful for recovering from crashed consumers that left messages
+        unacknowledged.
+        """
+        redis = await self._ensure_redis()
+        stream_key = self._stream_key(run_id)
+        group_name = self._group_name(run_id)
+
+        try:
+            _start, claimed, _deleted = await redis.xautoclaim(
+                stream_key,
+                group_name,
+                self._consumer_name,
+                self._claim_idle_ms,
+                "0-0",
+                count=count,
+            )
+            events = []
+            for msg_id, fields in claimed:
+                event_name = fields.get("event", "")
+                data_raw = fields.get("data", "")
+                try:
+                    data = json.loads(data_raw) if data_raw else None
+                except (json.JSONDecodeError, TypeError):
+                    data = data_raw
+                events.append(StreamEvent(id=str(msg_id), event=event_name, data=data))
+            return events
+        except Exception:
+            logger.warning("XAUTOCLAIM failed for run %s", run_id, exc_info=True)
+            return []
